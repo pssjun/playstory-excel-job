@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>데이터 요청 목록</title>
+  <style>
+    body { font-family: -apple-system, "Malgun Gothic", sans-serif; margin: 0; background: #f5f7fa; color: #222; }
+    main { max-width: 1100px; margin: 40px auto; padding: 0 16px; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
+    h1 { font-size: 22px; margin: 0; }
+    button { background: #2f6fed; color: #fff; border: 0; border-radius: 6px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
+    button:disabled { background: #9bb5ee; cursor: default; }
+    #message { min-height: 20px; font-size: 14px; color: #c0392b; margin-bottom: 8px; }
+    .table-wrap { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #eee; text-align: left; white-space: nowrap; }
+    th { background: #fafbfc; font-weight: 600; }
+    .badge { padding: 3px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+    .pending    { background: #eee;    color: #555; }
+    .processing { background: #fff4d6; color: #a86b00; }
+    .done       { background: #dff5e3; color: #1e7b34; }
+    .failed     { background: #fde2e1; color: #b3261e; }
+    .progress { font-size: 12px; color: #888; margin-left: 6px; }
+    .path { font-family: monospace; font-size: 12px; color: #555; }
+    .empty { text-align: center; color: #999; padding: 40px; }
+    .hint { font-size: 13px; color: #888; margin-top: 8px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>데이터 요청 목록</h1>
+    <button id="createBtn">엑셀 생성 요청</button>
+  </header>
+  <div id="message"></div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>job_id</th><th>요청일시</th><th>시작시간</th><th>완료시간</th><th>상태</th><th>파일경로</th>
+        </tr>
+      </thead>
+      <tbody id="jobRows"><tr><td colspan="6" class="empty">불러오는 중...</td></tr></tbody>
+    </table>
+  </div>
+  <p class="hint" id="pollHint"></p>
+</main>
+
+<script>
+  const POLL_MS = 2000;
+  let pollTimer = null;
+
+  const fmt = (iso) => iso ? new Date(iso).toLocaleString("ko-KR", { hour12: false }) : "-";
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function statusCell(job) {
+    let html = `<span class="badge ${job.status}">${job.status}</span>`;
+    if (job.status === "processing" && job.total_rows) {
+      const pct = Math.floor((job.processed_rows / job.total_rows) * 100);
+      html += `<span class="progress">${pct}%</span>`;
+    }
+    if (job.status === "failed" && job.error_message) {
+      html = `<span title="${esc(job.error_message)}">${html}</span>`;
+    }
+    return html;
+  }
+
+  function fileCell(job) {
+    if (!job.file_path) return "-";
+    return `<span class="path">${esc(job.file_path)}</span> <a href="/api/jobs/${job.job_id}/download">다운로드</a>`;
+  }
+
+  async function loadJobs() {
+    clearTimeout(pollTimer);
+    try {
+      const res = await fetch("/api/jobs");
+      const jobs = await res.json();
+      render(jobs);
+
+      // 아직 끝나지 않은 작업이 있을 때만 2초 뒤 다시 조회 (할 일 없으면 폴링 멈춤)
+      const active = jobs.some((j) => j.status === "pending" || j.status === "processing");
+      document.getElementById("pollHint").textContent = active ? "진행 중인 작업이 있어 2초마다 자동으로 갱신합니다." : "";
+      if (active) pollTimer = setTimeout(loadJobs, POLL_MS);
+    } catch (e) {
+      showMessage("목록을 불러오지 못했습니다. 잠시 후 다시 시도합니다.");
+      pollTimer = setTimeout(loadJobs, POLL_MS * 2);
+    }
+  }
+
+  function render(jobs) {
+    const tbody = document.getElementById("jobRows");
+    if (jobs.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty">아직 요청이 없습니다. '엑셀 생성 요청'을 눌러보세요.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = jobs.map((j) => `
+      <tr>
+        <td>${j.job_id}</td>
+        <td>${fmt(j.requested_at)}</td>
+        <td>${fmt(j.started_at)}</td>
+        <td>${fmt(j.finished_at)}</td>
+        <td>${statusCell(j)}</td>
+        <td>${fileCell(j)}</td>
+      </tr>`).join("");
+  }
+
+  function showMessage(text) {
+    document.getElementById("message").textContent = text;
+  }
+
+  document.getElementById("createBtn").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    showMessage("");
+    try {
+      const res = await fetch("/api/jobs", { method: "POST" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showMessage(body.detail || `요청 실패 (${res.status})`);
+      }
+      await loadJobs();
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  loadJobs();
+</script>
+</body>
+</html>

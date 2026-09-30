@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: playstory
+    volumes:
+      # 컨테이너가 처음 뜰 때(볼륨이 비어 있을 때) 이 폴더의 SQL이 순서대로 실행된다
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 : init 스크립트(시드 10만 건)가 끝나야 TCP가 열리므로 "시드 완료 후 healthy"가 된다
+      test: ["CMD-SHELL", "pg_isready -U app -d playstory -h 127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: ./app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://app:app@db:5432/playstory
+      EXPORT_DIR: /data/exports
+    volumes:
+      - exports:/data/exports
+    depends_on:
+      db:
+        condition: service_healthy
+    # 과제에서 지정한 고정 리소스 (변경 금지)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+volumes:
+  pgdata:
+  exports:

@@ -1,9 +1,10 @@
 """
-엑셀 생성 워커 = 주방의 요리사 1명.
+엑셀 생성 워커 (백그라운드 스레드 1개)
 
-- 1초마다 jobs 테이블(주문판)을 보고, 가장 오래된 pending 작업을 하나 가져와 처리한다.
-- 요리사가 1명이라 엑셀은 항상 한 번에 하나씩만 만들어진다.
-  → 요청이 100개 몰려도 메모리 사용량은 "엑셀 1개 만들 때"만큼으로 고정된다.
+- 1초마다 jobs 테이블을 보고, 가장 오래된 pending 작업을 하나 가져와 처리한다.
+- 워커가 1개라 엑셀 생성은 항상 한 번에 하나만 실행된다.
+  → 요청이 몰려도 "엑셀 생성 작업"이 동시에 쓰는 메모리·CPU는 1건 분량으로 제한된다. (대신 대기 시간이 늘어난다)
+- 단일 프로세스·단일 워커를 전제로 설계했다. (서버 시작 시 정리 코드가 이 전제에 의존함)
 """
 import logging
 import os
@@ -23,8 +24,8 @@ except ImportError:
 
 EXPORT_DIR = os.environ.get("EXPORT_DIR", "./exports")
 TMP_DIR = os.path.join(EXPORT_DIR, "tmp")  # 엑셀 라이브러리가 쓰는 작업용 임시 파일 위치
-CHUNK_SIZE = 5000          # DB에서 한 번에 가져오는 행 수 (한 그릇씩 담기)
-POLL_INTERVAL_SEC = 1.0    # 할 일이 없을 때 주문판을 다시 보는 간격
+CHUNK_SIZE = 5000          # DB에서 한 번에 가져오는 행 수
+POLL_INTERVAL_SEC = 1.0    # 할 일이 없을 때(또는 오류 후) jobs 테이블을 다시 보는 간격
 
 log = logging.getLogger("worker")
 
@@ -49,7 +50,12 @@ def _run_forever(stop_event: threading.Event) -> None:
             stop_event.wait(POLL_INTERVAL_SEC)  # 할 일 없음 → 잠깐 쉬기
             continue
 
-        process_job(job_id)
+        try:
+            process_job(job_id)
+        except Exception:
+            # process_job 안에서 처리하지 못한 예외가 있어도 워커 스레드는 죽지 않고 다음 작업을 기다린다.
+            log.exception("job %s: unexpected error", job_id)
+            stop_event.wait(POLL_INTERVAL_SEC)
     log.info("excel worker stopped")
 
 
@@ -57,8 +63,9 @@ def claim_next_job() -> int | None:
     """
     가장 오래된 pending 작업 하나를 processing으로 바꾸고 그 id를 돌려준다.
 
-    FOR UPDATE SKIP LOCKED: 다른 누군가 이미 잡은 작업은 건너뛴다.
-    지금은 워커가 1명이라 필요 없지만, 나중에 워커를 늘려도 같은 작업을 두 번 처리하지 않게 해 둔 안전장치.
+    FOR UPDATE SKIP LOCKED: 다른 트랜잭션이 잠근 행은 건너뛴다.
+    여러 워커가 "동시에 같은 pending 작업을 가져가는" 충돌을 막는 쿼리다.
+    다만 시스템 전체는 단일 워커 전제라서, 워커를 늘리려면 서버 시작 시 정리 로직도 함께 바꿔야 한다.
     """
     with connect() as conn:
         row = conn.execute(
@@ -118,15 +125,25 @@ def process_job(job_id: int) -> None:
 
     except Exception as e:
         log.exception("job %s: failed", job_id)
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        _mark_failed(job_id, f"{type(e).__name__}: {e}")
+        # 정리 단계에서 또 실패해도(예: DB가 계속 죽어 있음) 예외를 밖으로 던지지 않는다.
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            log.exception("job %s: could not remove temp file", job_id)
+        try:
+            _mark_failed(job_id, f"{type(e).__name__}: {e}")
+        except Exception:
+            # 실패 기록도 못 했으면 이 작업은 processing으로 남는다.
+            # 복구 범위: 다음 서버 시작 시 recover_interrupted_jobs()가 failed로 정리한다. (실행 중 자동 복구는 하지 않음)
+            log.exception("job %s: could not record failure; stays 'processing' until next restart", job_id)
 
 
 def recover_interrupted_jobs() -> int:
     """
-    서버가 켜질 때 호출한다.
-    processing 상태로 남은 작업 = 만드는 도중에 서버가 꺼진 작업 → failed로 정리.
+    서버가 켜질 때(워커 시작 전) 호출한다.
+    processing 상태로 남은 작업 = 만드는 도중 서버가 꺼졌거나, 실패를 DB에 기록하지 못한 작업 → failed로 정리.
+    단일 프로세스 전제: 다른 인스턴스가 함께 떠 있다면 그쪽이 처리 중인 작업까지 failed로 바꿔버린다.
 
     pending으로 되돌려 자동 재시도하지 않는 이유:
     그 작업 때문에 서버가 죽은 거라면(예: 메모리 부족) 재시작 → 재시도 → 또 죽음을 무한 반복할 수 있다.
@@ -151,7 +168,8 @@ def cleanup_leftover_files() -> int:
     서버가 켜질 때 호출한다. 작업 도중 서버가 죽으면 남는 찌꺼기 파일을 지운다.
     - TMP_DIR 안의 임시 파일 (행 데이터가 압축 전 상태로 20MB 넘게 쌓여 있음)
     - EXPORT_DIR 안의 *.part 파일 (압축하다 멈춘 결과 파일)
-    워커가 아직 시작되기 전에만 호출하므로, 지금 쓰고 있는 파일을 지울 일은 없다.
+    워커가 아직 시작되기 전에만 호출하므로, 이 프로세스가 쓰고 있는 파일을 지울 일은 없다.
+    (단일 프로세스 전제. 인스턴스가 여러 개라면 다른 인스턴스의 작업 파일을 지울 수 있다.)
     """
     os.makedirs(TMP_DIR, exist_ok=True)
     targets = [os.path.join(TMP_DIR, f) for f in os.listdir(TMP_DIR)]

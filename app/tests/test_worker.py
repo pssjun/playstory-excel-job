@@ -1,4 +1,8 @@
 """워커의 DB 없이 확인할 수 있는 부분 테스트"""
+import threading
+
+import psycopg
+
 import worker
 
 
@@ -36,3 +40,38 @@ def test_서버_재시작시_찌꺼기_파일만_지우고_완성된_파일은_�
     assert removed == 2
     assert sorted(p.name for p in export_dir.iterdir()) == ["orders_job_1.xlsx", "tmp"]
     assert list(tmp_dir.iterdir()) == []
+
+
+def test_DB가_계속_죽어_있어도_process_job은_예외를_밖으로_던지지_않는다(tmp_path, monkeypatch):
+    def broken_connect(**kwargs):
+        raise psycopg.OperationalError("DB 연결 실패 (모의)")
+
+    monkeypatch.setattr(worker, "EXPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(worker, "connect", broken_connect)
+
+    # 엑셀 생성도 실패하고, 실패 기록(_mark_failed)도 실패하는 상황
+    worker.process_job(1)  # 예외가 나면 이 테스트가 실패한다
+
+
+def test_작업_처리_중_예상못한_예외가_나도_워커는_다음_작업을_계속_처리한다(monkeypatch):
+    stop = threading.Event()
+    queue = [1, 2]
+    processed = []
+
+    def fake_claim():
+        if not queue:
+            stop.set()  # 할 일을 다 하면 워커를 멈춘다
+            return None
+        return queue.pop(0)
+
+    def exploding_process(job_id):
+        processed.append(job_id)
+        raise RuntimeError("예상 못한 오류 (모의)")
+
+    monkeypatch.setattr(worker, "claim_next_job", fake_claim)
+    monkeypatch.setattr(worker, "process_job", exploding_process)
+    monkeypatch.setattr(worker, "POLL_INTERVAL_SEC", 0.01)
+
+    worker._run_forever(stop)  # 1번 작업에서 예외가 나도 루프가 끝나지 않고 2번까지 처리해야 한다
+
+    assert processed == [1, 2]

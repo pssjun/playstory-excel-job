@@ -1,0 +1,46 @@
+# 비교 실험 전용 환경 (본 서비스와 별개)
+#   docker compose -p playstory-exp -f experiments/docker-compose.yml up --build -d
+# 같은 DB·같은 시드 데이터·같은 리소스 제한에서 두 방식을 비교한다.
+
+x-limits: &limits
+  deploy:
+    resources:
+      limits:
+        cpus: '0.5'
+        memory: 512M
+      reservations:
+        cpus: '0.25'
+        memory: 256M
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: playstory
+    volumes:
+      - ../db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d playstory -h 127.0.0.1"]
+      interval: 2s
+      retries: 30
+
+  naive:                      # 단순한 방식
+    build: ./naive
+    ports: ["8001:8000"]
+    environment:
+      DATABASE_URL: postgresql://app:app@db:5432/playstory
+    depends_on:
+      db: { condition: service_healthy }
+    <<: *limits
+
+  queue:                      # 이 프로젝트의 방식 (본 서비스 코드 그대로)
+    build: ../app
+    ports: ["8002:8000"]
+    environment:
+      DATABASE_URL: postgresql://app:app@db:5432/playstory
+      EXPORT_DIR: /data/exports
+    depends_on:
+      db: { condition: service_healthy }
+    <<: *limits

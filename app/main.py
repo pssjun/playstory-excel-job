@@ -12,7 +12,12 @@ from worker import EXPORT_DIR, cleanup_leftover_files, recover_interrupted_jobs,
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
-MAX_PENDING_JOBS = 20  # 대기 중인 번호표가 이만큼 쌓이면 새 주문은 잠시 거절 (무한정 쌓이는 것 방지)
+MAX_PENDING_JOBS = 20  # pending 작업이 이만큼 쌓이면 새 요청은 429로 거절 (대기열이 끝없이 쌓이는 것 방지)
+
+# "개수 확인 → 등록"을 한 번에 한 요청씩만 실행하게 하는 잠금.
+# 없으면 두 요청이 동시에 19개를 보고 둘 다 등록해서 상한을 넘을 수 있다.
+# 단일 프로세스 전제이므로 파이썬 Lock으로 충분하다.
+_create_lock = threading.Lock()
 
 JOB_COLUMNS = """
     id AS job_id, status, requested_at, started_at, finished_at,
@@ -22,7 +27,7 @@ JOB_COLUMNS = """
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 서버 시작 시: DB 연결 확인 → 중단된 작업·찌꺼기 파일 정리 → 요리사(워커) 출근
+    # 서버 시작 시: DB 연결 확인 → 중단된 작업·남은 임시 파일 정리 → 워커 시작
     wait_for_db()
     os.makedirs(EXPORT_DIR, exist_ok=True)
     recover_interrupted_jobs()
@@ -30,7 +35,7 @@ async def lifespan(app: FastAPI):
     stop_event = threading.Event()
     worker_thread = start_worker(stop_event)
     yield
-    # 서버 종료 시: 요리사 퇴근
+    # 서버 종료 시: 워커 정지
     stop_event.set()
     worker_thread.join(timeout=10)
 
@@ -40,8 +45,8 @@ app = FastAPI(title="Playstory Excel Export", lifespan=lifespan)
 
 @app.post("/api/jobs", status_code=202)
 def create_job():
-    """엑셀 생성 요청. 파일을 만들지 않고 번호표(job)만 발급한 뒤 바로 응답한다."""
-    with connect() as conn:
+    """엑셀 생성 요청. 파일은 만들지 않고 작업(job)만 등록한 뒤 바로 응답한다."""
+    with _create_lock, connect() as conn:
         pending = conn.execute("SELECT count(*) AS n FROM jobs WHERE status = 'pending'").fetchone()["n"]
         if pending >= MAX_PENDING_JOBS:
             raise HTTPException(429, "대기 중인 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.")

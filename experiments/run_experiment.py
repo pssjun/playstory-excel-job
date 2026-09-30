@@ -19,8 +19,10 @@ CONCURRENCY = [1, 3, 5, 10]
 TIMEOUT_SEC = 900
 
 VARIANTS = {
-    "naive": {"port": 8001, "create": "/jobs", "status": "/jobs/{id}", "container": f"{PROJECT}-naive-1"},
-    "queue": {"port": 8002, "create": "/api/jobs", "status": "/api/jobs/{id}", "container": f"{PROJECT}-queue-1"},
+    "naive": {"label": "전체 적재·동시 실행", "port": 8001, "create": "/jobs", "status": "/jobs/{id}",
+              "container": f"{PROJECT}-naive-1"},
+    "queue": {"label": "대기열·스트리밍 (이 프로젝트)", "port": 8002, "create": "/api/jobs", "status": "/api/jobs/{id}",
+              "container": f"{PROJECT}-queue-1"},
 }
 
 
@@ -77,12 +79,16 @@ def run_scenario(name: str, n: int) -> dict:
     idle = mem_mib(v["container"])
 
     # N건을 동시에 요청
-    ids, lock = [], threading.Lock()
+    ids, post_errors, lock = [], [], threading.Lock()
 
     def post():
-        job = http("POST", base + v["create"])
-        with lock:
-            ids.append(job["job_id"])
+        try:
+            job = http("POST", base + v["create"])
+            with lock:
+                ids.append(job["job_id"])
+        except Exception as e:  # 429·연결 실패 등 → "접수 실패"로 따로 센다
+            with lock:
+                post_errors.append(repr(e))
 
     threads = [threading.Thread(target=post) for _ in range(n)]
     started = time.monotonic()
@@ -91,29 +97,50 @@ def run_scenario(name: str, n: int) -> dict:
     for t in threads:
         t.join()
 
-    peak, result = idle or 0, "timeout"
-    while time.monotonic() - started < TIMEOUT_SEC:
+    peak, samples, state = idle or 0, 0, "timeout"
+    done = failed = 0
+    while ids and time.monotonic() - started < TIMEOUT_SEC:
         m = mem_mib(v["container"])
         if m is not None:
-            peak = max(peak, m)
+            peak, samples = max(peak, m), samples + 1
         if not is_running(v["container"]):
-            result = "OOM Killed 💥" if oom_killed(v["container"]) else "crashed"
+            state = "OOM Killed" if oom_killed(v["container"]) else "crashed"
             break
         try:
             statuses = [http("GET", base + v["status"].format(id=i))["status"] for i in ids]
         except Exception:
             continue  # 죽는 중일 수 있음 → 다음 루프에서 is_running으로 판정
-        if all(s == "done" or s.startswith("failed") for s in statuses):
-            failed = sum(s.startswith("failed") for s in statuses)
-            result = "all done ✅" if failed == 0 else f"{failed} failed"
+        done = sum(s == "done" for s in statuses)
+        failed = sum(s.startswith("failed") for s in statuses)
+        if done + failed == len(ids):
+            state = "finished"
             break
+
+    # 성공 판정: 요청한 개수 = 접수된 개수 = 완료된 개수 일 때만 성공
+    accepted = len(ids)
+    if not ids:
+        result = "요청 전부 실패"
+    elif state == "finished" and accepted == n and done == n:
+        result = "성공"
+    elif state in ("OOM Killed", "crashed"):
+        result = f"컨테이너 종료 ({state})"
+    elif state == "timeout":
+        result = "시간 초과"
+    else:
+        result = "일부 실패"
 
     row = {
         "variant": name,
-        "concurrency": n,
+        "label": v["label"],
+        "requested": n,
+        "accepted": accepted,
+        "post_failed": len(post_errors),
+        "done": done,
+        "job_failed": failed,
         "result": result,
         "idle_mib": round(idle or 0),
         "peak_mib": round(peak),
+        "mem_samples": samples,
         "elapsed_sec": round(time.monotonic() - started, 1),
     }
     print(row, flush=True)
@@ -126,17 +153,22 @@ def main() -> None:
         for n in CONCURRENCY:
             row = run_scenario(name, n)
             rows.append(row)
-            if not row["result"].startswith("all done"):
-                break  # 이미 죽었으면 더 많은 동시 요청은 의미 없음
+            if row["result"] != "성공":
+                break  # 이미 실패했으면 더 많은 동시 요청은 의미 없음
 
     lines = [
-        "| 방식 | 동시 요청 | 결과 | 대기 메모리 | 최대 메모리 | 전체 소요 |",
-        "|---|---|---|---|---|---|",
+        "- 각 시나리오 1회 실행. 시나리오마다 컨테이너를 재시작한 뒤 측정.",
+        "- 메모리: `docker stats`를 약 1~2초 간격으로 관측한 값 중 최댓값 (관측 사이의 순간 최댓값은 놓칠 수 있음).",
+        "- 성공 = 요청 수 = 접수 수 = 완료 수.",
+        "",
+        "| 방식 | 요청 | 접수 | 접수 실패 | 완료 | 작업 실패 | 결과 | 대기 메모리 | 최대 메모리(관측) | 관측 횟수 | 전체 소요 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
-            f"| {r['variant']} | {r['concurrency']}건 | {r['result']} | {r['idle_mib']}MiB "
-            f"| {r['peak_mib']}MiB | {r['elapsed_sec']}초 |"
+            f"| {r['label']} | {r['requested']} | {r['accepted']} | {r['post_failed']} | {r['done']} "
+            f"| {r['job_failed']} | {r['result']} | {r['idle_mib']}MiB | {r['peak_mib']}MiB "
+            f"| {r['mem_samples']} | {r['elapsed_sec']}초 |"
         )
     out = Path(__file__).with_name("results.md")
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")

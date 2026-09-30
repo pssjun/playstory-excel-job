@@ -25,6 +25,21 @@ docker compose up --build
 - 외부 계정이나 외부 서비스 없이 로컬에서만 동작합니다.
 - 처음부터 다시 시작하려면(DB·파일 초기화): `docker compose down -v`
 
+### 테스트 실행
+로컬에 파이썬이 없어도 앱 컨테이너 안에서 돌릴 수 있습니다.
+```bash
+docker compose run --rm --no-deps app sh -c "pip install -q -r requirements-dev.txt && pytest -v"
+```
+DB가 필요 없는 핵심 로직만 테스트합니다. (5개)
+
+| 테스트 | 확인하는 것 |
+|---|---|
+| `test_모든_행과_헤더가_엑셀에_들어간다` | 여러 묶음으로 나눠 써도 행 수, 순서, 헤더, 날짜 형식이 맞는지 |
+| `test_묶음마다_진행률을_알려준다` | 화면의 진행률 %에 쓰이는 값이 묶음마다 보고되는지 |
+| `test_데이터가_없어도_헤더만_있는_파일이_만들어진다` | 0건일 때 에러 없이 빈 엑셀이 만들어지는지 |
+| `test_커서에서_CHUNK_SIZE씩_나눠서_가져온다` | DB에서 5,000건씩 끊어 읽는지 (가짜 커서 사용) |
+| `test_서버_재시작시_찌꺼기_파일만_지우고_완성된_파일은_남긴다` | 5장의 "발견해서 고친 문제"가 다시 생기지 않는지 |
+
 ### API
 
 | Method | Path | 설명 |
@@ -201,7 +216,8 @@ docker compose -p playstory-exp -f experiments/docker-compose.yml down -v
     ├── worker.py          # 워커 스레드: 작업 가져오기 → 엑셀 생성 → 상태 기록
     ├── excel.py           # XlsxWriter로 엑셀 쓰기 (DB와 분리해서 따로 테스트 가능)
     ├── db.py              # DB 연결
-    └── static/index.html  # 데이터 요청 목록 화면
+    ├── static/index.html  # 데이터 요청 목록 화면
+    └── tests/             # pytest (엑셀 쓰기, 청크 분할, 재시작 시 파일 정리)
 experiments/               # 비교 실험 (본 서비스와 별개, 5-1 참고)
 ├── docker-compose.yml     # 흔한 방식 vs 이 프로젝트, 같은 리소스 제한
 ├── naive/main.py          # 흔한 방식 구현

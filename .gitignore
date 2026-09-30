@@ -4,3 +4,4 @@ __pycache__/
 exports/
 *.xlsx
 *.part
+.pytest_cache/

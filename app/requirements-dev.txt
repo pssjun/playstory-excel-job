@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest==8.3.4
+openpyxl==3.1.5   # 테스트에서 만들어진 엑셀을 다시 읽어 검증하는 용도

@@ -9,7 +9,7 @@ CREATE TABLE orders (
     order_date   TIMESTAMP    NOT NULL
 );
 
--- 엑셀 생성 작업 (= 번호표). 이 테이블이 곧 작업 대기열(큐) 역할을 한다.
+-- 엑셀 생성 작업. 이 테이블이 곧 작업 대기열(큐) 역할을 한다.
 CREATE TABLE jobs (
     id             SERIAL PRIMARY KEY,
     status         VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending / processing / done / failed
